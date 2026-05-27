@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Kanban Board</title>
+<title>agentkan — board</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   :root {
@@ -205,7 +205,7 @@ async function refresh() {
     const r = await fetch(`/api/projects/${SLUG}?t=${Date.now()}`);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    document.title = data.project_name + ' — Kanban';
+    document.title = data.project_name + ' — agentkan';
     document.getElementById('project').textContent = data.project_name;
     document.getElementById('meta').innerHTML =
       `updated ${escape(fmt(data.updated_at))}` +
