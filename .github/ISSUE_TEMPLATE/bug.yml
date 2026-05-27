@@ -1,0 +1,52 @@
+name: Bug report
+description: Something broke. Help us reproduce it.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The more specific, the faster we can help.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, what actually happened?
+      placeholder: "Ran `kanban tick` and the UI agent claimed a backend card..."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps that trigger the bug. Include any relevant `kanban.json` (redact private info).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste relevant log output from `logs/<agent>/`. Redact API keys.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: agentkan version (or commit SHA)
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: claude --version output
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - macOS
+        - Linux
+        - WSL
+        - Other
+    validations:
+      required: true

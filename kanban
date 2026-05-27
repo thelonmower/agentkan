@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""
+kanban — multi-project Kanban hub for Claude Code agents.
+
+Subcommands:
+  init                 set up ~/.kanban-hub
+  new <name>           create a new project (runs intake interview)
+  list                 list all projects with status
+  view [project]       launch the hub UI in your browser (or a single board)
+  run <project> <ag>   run one tick for one agent (cron / manual)
+  tick                 run one tick across ALL projects and agents (cron entry)
+  add-card <project>   add a card to an existing project (intake interview)
+  add-agent <project>  add a new agent to an existing project (intake interview)
+  pause <project>      disable cron ticks for a project
+  resume <project>     re-enable
+  status               quick overview of everything
+  cron                 print the cron line to install
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Layout
+
+HOME = Path.home()
+HUB = Path(os.environ.get("KANBAN_HUB", HOME / ".kanban-hub")).resolve()
+HUB_BIN = HUB / "bin"
+HUB_PROMPTS = HUB / "prompts"
+HUB_TEMPLATES = HUB / "templates"
+HUB_STATIC = HUB / "static"
+HUB_PROJECTS = HUB / "projects"
+HUB_LOGS = HUB / "logs"
+
+# When installed, the CLI lives at ~/.local/bin/kanban and the support files
+# (bin/, prompts/, etc.) live in ~/.kanban-hub/. The install script copies them.
+INSTALL_ROOT = Path(__file__).resolve().parent
+
+C_RESET = "\033[0m"
+C_BOLD  = "\033[1m"
+C_DIM   = "\033[2m"
+C_GREEN = "\033[32m"
+C_YELLOW= "\033[33m"
+C_RED   = "\033[31m"
+C_BLUE  = "\033[34m"
+C_CYAN  = "\033[36m"
+
+def color(s, c): return f"{c}{s}{C_RESET}" if sys.stdout.isatty() else s
+
+# ---------------------------------------------------------------------------
+# Helpers
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^\w\s-]", "", name).strip().lower()
+    s = re.sub(r"[-\s]+", "-", s)
+    return s or "project"
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def die(msg: str, code: int = 1):
+    print(color(f"error: {msg}", C_RED), file=sys.stderr)
+    sys.exit(code)
+
+def require(cmd: str):
+    if shutil.which(cmd) is None:
+        die(f"{cmd!r} not found in PATH")
+
+def load_board(project_dir: Path) -> dict:
+    return json.loads((project_dir / "kanban.json").read_text())
+
+def project_dir(name: str) -> Path:
+    p = HUB_PROJECTS / slugify(name)
+    if not p.exists():
+        die(f"no project named {name!r} (looked at {p})")
+    return p
+
+def list_project_dirs() -> list[Path]:
+    if not HUB_PROJECTS.exists():
+        return []
+    return sorted(p for p in HUB_PROJECTS.iterdir()
+                  if p.is_dir() and (p / "kanban.json").exists())
+
+def copy_clipboard(text: str) -> str | None:
+    """Best-effort copy to clipboard. Returns the tool used, or None."""
+    for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"],
+                ["wl-copy"], ["clip.exe"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text, text=True, check=True)
+                return cmd[0]
+            except Exception:
+                pass
+    return None
+
+# ---------------------------------------------------------------------------
+# init
+
+def cmd_init(args):
+    HUB.mkdir(parents=True, exist_ok=True)
+    HUB_PROJECTS.mkdir(exist_ok=True)
+    HUB_LOGS.mkdir(exist_ok=True)
+    # Copy the bundled support files (bin/, prompts/, templates/, static/)
+    # from wherever the install script put them, into HUB.
+    src_root = Path(os.environ.get("KANBAN_SOURCE", INSTALL_ROOT))
+    for sub in ("bin", "prompts", "templates", "static"):
+        src = src_root / sub
+        dst = HUB / sub
+        if src.exists():
+            if dst.exists(): shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            # make scripts executable
+            if sub == "bin":
+                for p in dst.iterdir():
+                    p.chmod(0o755)
+    # Write a config stub if missing
+    cfg = HUB / "config.json"
+    if not cfg.exists():
+        cfg.write_text(json.dumps({
+            "created_at": now_iso(),
+            "default_tools": "Read,Write,Edit,Bash,Grep,Glob",
+        }, indent=2))
+    print(color(f"✓ hub ready at {HUB}", C_GREEN))
+    print(f"  next: {color('kanban new <project-name>', C_BOLD)}")
+
+# ---------------------------------------------------------------------------
+# new — create a project, then run intake
+
+def cmd_new(args):
+    name = " ".join(args.name).strip()
+    if not name: die("project name required")
+    slug = slugify(name)
+    pdir = HUB_PROJECTS / slug
+    if pdir.exists():
+        die(f"project {slug!r} already exists at {pdir}")
+
+    # Scaffold from templates
+    pdir.mkdir(parents=True)
+    (pdir / "agents").mkdir()
+    (pdir / "worktrees").mkdir()
+    (pdir / "logs").mkdir()
+    (pdir / "repo").mkdir()
+
+    # Empty placeholder board — the intake will populate it
+    placeholder = {
+        "project_name": name,
+        "slug": slug,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "status": "intake",
+        "agents": {},
+        "columns": {"todo": [], "in_progress": [], "blocked": [], "done": []},
+        "proposed_tasks": [],
+        "notes_for_human": [],
+    }
+    (pdir / "kanban.json").write_text(json.dumps(placeholder, indent=2))
+
+    # Copy the per-project scripts so the project is self-sufficient
+    for fn in ("runner.sh", "claim.sh", "notify.sh", "setup-agents.sh"):
+        shutil.copy(HUB_BIN / fn, pdir / fn)
+        (pdir / fn).chmod(0o755)
+    shutil.copy(HUB_PROMPTS / "runtime-agent.md", pdir / "agent-prompt.md")
+
+    # Build the intake message and drop it as INTAKE.md inside the project
+    intake = (HUB_PROMPTS / "new-project-intake.md").read_text()
+    intake = intake.replace("{{PROJECT_NAME}}", name).replace("{{SLUG}}", slug)
+    (pdir / "INTAKE.md").write_text(intake)
+
+    print(color(f"✓ scaffolded {slug} at {pdir}", C_GREEN))
+
+    # The launch line the user pastes into claude
+    paste = ("Read INTAKE.md in this directory and conduct the project intake "
+             "interview with me. When intake is complete, delete INTAKE.md.")
+    tool = copy_clipboard(paste)
+    if tool:
+        print(f"  ✓ launch prompt copied to clipboard (via {tool})")
+    else:
+        print(f"  → paste this into claude: {color(paste, C_DIM)}")
+
+    print()
+    print(color("launching claude in interactive mode...", C_CYAN))
+    print(color("(when intake is done, run: kanban view)", C_DIM))
+    print()
+    os.chdir(pdir)
+    os.execvp("claude", ["claude"])
+
+# ---------------------------------------------------------------------------
+# add-card / add-agent — incremental intake on an existing project
+
+def _intake_in_project(pdir: Path, prompt_file: str, paste: str):
+    """Launch claude in the project dir with a templated intake prompt."""
+    prompt = (HUB_PROMPTS / prompt_file).read_text()
+    prompt = prompt.replace("{{PROJECT_NAME}}", load_board(pdir)["project_name"])
+    intake_file = pdir / f".intake-{int(time.time())}.md"
+    intake_file.write_text(prompt)
+    paste_real = paste.replace("{{INTAKE_FILE}}", intake_file.name)
+    tool = copy_clipboard(paste_real)
+    if tool:
+        print(f"✓ launch prompt copied to clipboard (via {tool})")
+    else:
+        print(f"→ paste into claude: {color(paste_real, C_DIM)}")
+    print()
+    os.chdir(pdir)
+    os.execvp("claude", ["claude"])
+
+def cmd_add_card(args):
+    pdir = project_dir(args.project)
+    _intake_in_project(
+        pdir, "new-card-intake.md",
+        "Read {{INTAKE_FILE}} and conduct the new-card intake interview, "
+        "then append the card to kanban.json atomically."
+    )
+
+def cmd_add_agent(args):
+    pdir = project_dir(args.project)
+    _intake_in_project(
+        pdir, "new-agent-intake.md",
+        "Read {{INTAKE_FILE}} and conduct the new-agent intake interview. "
+        "Update kanban.json and create agents/<name>.md, then run ./setup-agents.sh."
+    )
+
+# ---------------------------------------------------------------------------
+# list / status
+
+def cmd_list(args):
+    dirs = list_project_dirs()
+    if not dirs:
+        print(color("no projects yet — try: kanban new <name>", C_DIM))
+        return
+    for pdir in dirs:
+        b = load_board(pdir)
+        n = {k: len(b["columns"][k]) for k in ("todo", "in_progress", "blocked", "done")}
+        agents = ", ".join(b.get("agents", {})) or color("(no agents yet)", C_DIM)
+        paused = (pdir / ".paused").exists()
+        flag = color("PAUSED", C_YELLOW) if paused else color("active", C_GREEN)
+        print(f"{color(pdir.name, C_BOLD)}  [{flag}]")
+        print(f"  agents: {agents}")
+        print(f"  todo {n['todo']}  ·  in_progress {color(n['in_progress'], C_CYAN)}  ·  "
+              f"blocked {color(n['blocked'], C_YELLOW)}  ·  done {color(n['done'], C_GREEN)}")
+        print()
+
+def cmd_status(args):
+    cmd_list(args)
+
+# ---------------------------------------------------------------------------
+# run / tick — the cron-driven core
+
+def cmd_run(args):
+    pdir = project_dir(args.project)
+    agent = args.agent
+    rc = subprocess.call(["./runner.sh", agent], cwd=pdir)
+    sys.exit(rc)
+
+def cmd_tick(args):
+    """Iterate every project, fire each agent that has work. Background-parallel."""
+    HUB_LOGS.mkdir(exist_ok=True)
+    fired = []
+    for pdir in list_project_dirs():
+        if (pdir / ".paused").exists():
+            continue
+        try:
+            board = load_board(pdir)
+        except Exception as e:
+            print(f"skip {pdir.name}: {e}", file=sys.stderr)
+            continue
+        for agent in board.get("agents", {}):
+            # Per-(project, agent) lock is inside runner.sh, so concurrent fires are safe.
+            log_dir = pdir / "logs" / agent
+            log_dir.mkdir(parents=True, exist_ok=True)
+            logf = open(log_dir / "tick.log", "a")
+            subprocess.Popen(["./runner.sh", agent], cwd=pdir,
+                             stdout=logf, stderr=subprocess.STDOUT)
+            fired.append(f"{pdir.name}/{agent}")
+    if fired:
+        print(f"{now_iso()} fired: {', '.join(fired)}")
+
+# ---------------------------------------------------------------------------
+# pause / resume
+
+def cmd_pause(args):
+    pdir = project_dir(args.project)
+    (pdir / ".paused").touch()
+    print(color(f"✓ paused {pdir.name}", C_YELLOW))
+
+def cmd_resume(args):
+    pdir = project_dir(args.project)
+    (pdir / ".paused").unlink(missing_ok=True)
+    print(color(f"✓ resumed {pdir.name}", C_GREEN))
+
+# ---------------------------------------------------------------------------
+# cron
+
+def cmd_cron(args):
+    bin_path = shutil.which("kanban") or str(INSTALL_ROOT / "kanban")
+    line = f"*/10 * * * * {bin_path} tick >> {HUB_LOGS / 'tick.log'} 2>&1"
+    print("Add this line to your crontab (run `crontab -e`):")
+    print()
+    print(color(f"  {line}", C_BOLD))
+    print()
+    print("That's it. One cron entry runs every project and every agent —")
+    print("per-(project, agent) locks prevent overlap and let everything run in parallel.")
+
+# ---------------------------------------------------------------------------
+# view — the hub server + browser
+
+class HubHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass  # silence access log
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
+
+        # API: list all projects
+        if path == "/api/projects":
+            data = []
+            for pdir in list_project_dirs():
+                try:
+                    b = load_board(pdir)
+                    data.append({
+                        "slug": pdir.name,
+                        "project_name": b.get("project_name", pdir.name),
+                        "updated_at": b.get("updated_at"),
+                        "status": b.get("status", "active"),
+                        "paused": (pdir / ".paused").exists(),
+                        "agents": list(b.get("agents", {}).keys()),
+                        "counts": {k: len(b["columns"][k]) for k in
+                                   ("todo", "in_progress", "blocked", "done")},
+                        "in_progress_titles": [c.get("title","") for c in
+                                               b["columns"]["in_progress"]],
+                    })
+                except Exception:
+                    continue
+            return self._json(data)
+
+        # API: one project's board
+        m = re.match(r"^/api/projects/([\w-]+)$", path)
+        if m:
+            slug = m.group(1)
+            pdir = HUB_PROJECTS / slug
+            if not (pdir / "kanban.json").exists():
+                return self._404()
+            return self._json(load_board(pdir))
+
+        # Static pages
+        if path in ("", "/", "/index.html"):
+            return self._serve_static("hub.html")
+        m = re.match(r"^/project/([\w-]+)/?$", path)
+        if m:
+            return self._serve_static("board.html",
+                replace={"{{SLUG}}": m.group(1)})
+        m = re.match(r"^/static/(.+)$", path)
+        if m:
+            return self._serve_static(m.group(1))
+
+        self._404()
+
+    def _json(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_static(self, name, replace=None):
+        f = HUB_STATIC / name
+        if not f.exists():
+            return self._404()
+        body = f.read_text()
+        if replace:
+            for k, v in replace.items(): body = body.replace(k, v)
+        body_b = body.encode()
+        ctype = "text/html" if name.endswith(".html") else (
+                "text/css" if name.endswith(".css") else "text/plain")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body_b)
+
+    def _404(self):
+        self.send_response(404); self.end_headers(); self.wfile.write(b"404")
+
+def _find_free_port(start=8765):
+    for p in range(start, start + 50):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    return start
+
+def cmd_view(args):
+    if not HUB_STATIC.exists():
+        die(f"hub not initialized — run `kanban init` first")
+    port = _find_free_port(args.port or 8765)
+    server = ThreadingHTTPServer(("127.0.0.1", port), HubHandler)
+    url = f"http://127.0.0.1:{port}/"
+    if args.project:
+        url += f"project/{slugify(args.project)}/"
+    print(color(f"hub running on {url}  (Ctrl-C to stop)", C_GREEN))
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+        server.server_close()
+
+# ---------------------------------------------------------------------------
+# main
+
+def main():
+    p = argparse.ArgumentParser(prog="kanban",
+        description="Multi-project Kanban hub for Claude Code agents.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="set up the hub")
+    sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("new", help="create a new project (runs intake)")
+    sp.add_argument("name", nargs="+")
+    sp.set_defaults(fn=cmd_new)
+
+    sp = sub.add_parser("list", help="list projects")
+    sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("status", help="quick overview")
+    sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("view", help="open the hub UI in a browser")
+    sp.add_argument("project", nargs="?", default=None,
+                    help="open a single project's board")
+    sp.add_argument("--port", type=int, default=None)
+    sp.set_defaults(fn=cmd_view)
+
+    sp = sub.add_parser("run", help="run one tick for one agent")
+    sp.add_argument("project"); sp.add_argument("agent")
+    sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("tick", help="run one tick across all projects (cron entry)")
+    sp.set_defaults(fn=cmd_tick)
+
+    sp = sub.add_parser("add-card", help="add a card via intake interview")
+    sp.add_argument("project")
+    sp.set_defaults(fn=cmd_add_card)
+
+    sp = sub.add_parser("add-agent", help="add an agent via intake interview")
+    sp.add_argument("project")
+    sp.set_defaults(fn=cmd_add_agent)
+
+    sp = sub.add_parser("pause", help="disable cron ticks for a project")
+    sp.add_argument("project"); sp.set_defaults(fn=cmd_pause)
+
+    sp = sub.add_parser("resume", help="re-enable cron ticks")
+    sp.add_argument("project"); sp.set_defaults(fn=cmd_resume)
+
+    sp = sub.add_parser("cron", help="print the cron line to install")
+    sp.set_defaults(fn=cmd_cron)
+
+    args = p.parse_args()
+    args.fn(args)
+
+if __name__ == "__main__":
+    main()

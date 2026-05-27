@@ -1,0 +1,19 @@
+# build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# tarballs from local builds
+*.tar.gz
+
+# local test scratch
+/tmp-test/

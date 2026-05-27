@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kanban Hub</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #fafaf8; --panel: #ffffff; --ink: #1a1a1a; --muted: #6b6b6b;
+    --line: #e6e3dd; --accent: #c2410c;
+    --todo: #6b7280; --progress: #c2410c; --blocked: #b91c1c; --done: #15803d;
+    --chip-bg: #f1eee7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14130f; --panel: #1d1c18; --ink: #ecebe6; --muted: #97948c;
+      --line: #2c2a25; --accent: #f97316;
+      --todo: #9ca3af; --progress: #f97316; --blocked: #ef4444; --done: #4ade80;
+      --chip-bg: #2c2a25;
+    }
+  }
+  * { box-sizing: border-box }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  header { padding: 22px 32px; border-bottom: 1px solid var(--line);
+    display:flex; align-items:center; justify-content:space-between; gap:24px; flex-wrap:wrap; }
+  header h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+  header h1 span { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 13px; }
+  header .meta b { color: var(--ink); font-weight: 600; }
+
+  main { padding: 24px 32px 80px; max-width: 1400px; margin: 0 auto; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px 16px; cursor: pointer; text-decoration: none; color: inherit;
+    transition: transform .08s ease, border-color .12s ease; display: block; }
+  .tile:hover { transform: translateY(-2px); border-color: var(--muted); }
+  .tile.paused { opacity: 0.6; }
+
+  .tile h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; letter-spacing: -0.005em; }
+  .tile .agents { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 14px; }
+  .tile .agent-chip { font: 11px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    padding: 1px 8px; border-radius: 999px; font-weight: 600; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px;
+    margin-bottom: 12px; }
+  .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 0; text-align: center; }
+  .stat .n { font-size: 18px; font-weight: 600; line-height: 1.1; }
+  .stat .l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); }
+  .stat[data-k=todo]        .n { color: var(--todo) }
+  .stat[data-k=in_progress] .n { color: var(--progress) }
+  .stat[data-k=blocked]     .n { color: var(--blocked) }
+  .stat[data-k=done]        .n { color: var(--done) }
+
+  .now { font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line);
+    padding-top: 10px; min-height: 18px; }
+  .now b { color: var(--progress); font-weight: 600; }
+  .now ul { margin: 4px 0 0; padding-left: 18px; }
+  .now ul li { margin: 2px 0; color: var(--ink); }
+
+  .pulse { display:inline-block; width:7px; height:7px; border-radius:50%;
+    background: var(--progress); margin-right:6px;
+    animation: pulse 1.6s ease-in-out infinite; vertical-align: 1px; }
+  @keyframes pulse { 0%,100% {opacity:1} 50% {opacity:.3} }
+
+  .empty { padding: 80px 20px; text-align: center; color: var(--muted); }
+  .empty h2 { font-size: 18px; color: var(--ink); margin: 0 0 8px; }
+  .empty code { background: var(--chip-bg); padding: 2px 8px; border-radius: 4px;
+    font: 13px/1.5 ui-monospace, monospace; }
+
+  .paused-badge { background: var(--chip-bg); color: var(--muted);
+    padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    margin-left: 8px; vertical-align: 2px; }
+
+  .error { color: var(--blocked); padding: 18px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Kanban <span>Hub</span></h1>
+  <div class="meta">auto-refresh: <b>5s</b> · last sync: <b id="lastSeen">—</b></div>
+</header>
+
+<main>
+  <div id="content"></div>
+</main>
+
+<script>
+const escape = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function agentColor(name) {
+  const palette = ['#c2410c','#1d4ed8','#15803d','#9333ea','#0891b2','#be123c','#a16207','#0f766e'];
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return palette[h % palette.length];
+}
+
+function tile(p) {
+  const agentChips = (p.agents || []).map(a => {
+    const c = agentColor(a);
+    return `<span class="agent-chip" style="background:${c}22;color:${c};border:1px solid ${c}44">${escape(a)}</span>`;
+  }).join('');
+
+  const cells = ['todo','in_progress','blocked','done'].map(k => `
+    <div class="stat" data-k="${k}">
+      <div class="n">${p.counts[k]}</div>
+      <div class="l">${k.replace('_',' ')}</div>
+    </div>`).join('');
+
+  const now = (p.in_progress_titles || []);
+  const nowBlock = now.length
+    ? `<div class="now"><b>now</b><ul>${now.map(t => `<li><span class="pulse"></span>${escape(t)}</li>`).join('')}</ul></div>`
+    : `<div class="now">${C_DIM('idle')}</div>`;
+
+  const pausedBadge = p.paused ? `<span class="paused-badge">paused</span>` : '';
+  const cls = 'tile' + (p.paused ? ' paused' : '');
+
+  return `
+    <a class="${cls}" href="/project/${escape(p.slug)}/">
+      <h2>${escape(p.project_name)}${pausedBadge}</h2>
+      <div class="agents">${agentChips || '<span style="color:var(--muted);font-size:12px">no agents yet</span>'}</div>
+      <div class="stats">${cells}</div>
+      ${nowBlock}
+    </a>`;
+}
+
+function C_DIM(s) { return `<span style="color:var(--muted)">${escape(s)}</span>`; }
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/projects?t=' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const projects = await r.json();
+    const el = document.getElementById('content');
+    if (!projects.length) {
+      el.innerHTML = `
+        <div class="empty">
+          <h2>No projects yet</h2>
+          <p>Create your first with:</p>
+          <p><code>kanban new my-cool-project</code></p>
+        </div>`;
+    } else {
+      el.innerHTML = `<div class="grid">${projects.map(tile).join('')}</div>`;
+    }
+    document.getElementById('lastSeen').textContent = new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('content').innerHTML =
+      `<div class="error">Failed to load projects: ${escape(e.message)}</div>`;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

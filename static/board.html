@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kanban Board</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #fafaf8; --panel: #ffffff; --ink: #1a1a1a; --muted: #6b6b6b;
+    --line: #e6e3dd; --accent: #c2410c;
+    --todo: #6b7280; --progress: #c2410c; --blocked: #b91c1c; --done: #15803d;
+    --chip-bg: #f1eee7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14130f; --panel: #1d1c18; --ink: #ecebe6; --muted: #97948c;
+      --line: #2c2a25; --accent: #f97316;
+      --todo: #9ca3af; --progress: #f97316; --blocked: #ef4444; --done: #4ade80;
+      --chip-bg: #2c2a25;
+    }
+  }
+  * { box-sizing: border-box }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 18px 28px; border-bottom: 1px solid var(--line);
+    display:flex; align-items:flex-start; justify-content:space-between; gap:24px; flex-wrap:wrap; }
+  .back { display: inline-block; color: var(--muted); text-decoration: none; font-size: 13px;
+    margin-bottom: 4px; }
+  .back:hover { color: var(--accent); }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+  header .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  header .meta b { color: var(--ink); font-weight: 600; }
+  .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 10px; }
+  .filters label { font-size: 12px; color: var(--muted); text-transform:uppercase;
+    letter-spacing: 0.06em; margin-right: 4px; }
+  .filter-btn { background: var(--panel); border: 1px solid var(--line);
+    color: var(--ink); padding: 4px 10px; border-radius: 999px; font-size: 12px;
+    cursor: pointer; display:inline-flex; align-items:center; gap:6px; }
+  .filter-btn:hover { border-color: var(--muted); }
+  .filter-btn.active { border-color: var(--accent); color: var(--accent); }
+  .filter-btn .dot { width:8px; height:8px; border-radius:50%; }
+
+  main { padding: 22px 28px 60px; }
+  .board { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 16px; }
+  @media (max-width: 1000px) { .board { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 640px)  { .board { grid-template-columns: 1fr; } }
+  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px; min-height: 200px; }
+  .col h2 { margin: 4px 4px 12px; font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    display:flex; justify-content:space-between; align-items:center; }
+  .col h2 .count { background: var(--chip-bg); color: var(--ink); padding: 2px 8px;
+    border-radius: 999px; font-size: 11px; }
+  .col[data-col="todo"]        h2 { color: var(--todo) }
+  .col[data-col="in_progress"] h2 { color: var(--progress) }
+  .col[data-col="blocked"]     h2 { color: var(--blocked) }
+  .col[data-col="done"]        h2 { color: var(--done) }
+
+  .card { background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 11px 12px; margin-bottom: 10px; transition: transform .08s;
+    border-left: 3px solid var(--line); }
+  .card:hover { transform: translateY(-1px); }
+  .card .row { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .card .id { font: 11px/1 ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); }
+  .card h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; line-height: 1.35; }
+  .card p  { margin: 0 0 6px; color: var(--muted); font-size: 13px; }
+  .card .meta-row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top: 6px; }
+  .agent-chip { font: 11px/1.5 ui-monospace, monospace; padding: 1px 8px;
+    border-radius: 999px; font-weight: 600; }
+  .card .deps { display:flex; flex-wrap:wrap; gap:4px; }
+  .card .deps span { background: var(--chip-bg); color: var(--muted);
+    padding: 1px 7px; border-radius: 6px; font: 11px/1.5 ui-monospace, monospace; }
+  .card .note { background: var(--chip-bg); border-left: 2px solid var(--accent);
+    padding: 8px 10px; margin-top: 8px; border-radius: 4px; font-size: 12.5px; color: var(--ink); }
+  .card .note b { display:block; font-size: 10.5px; text-transform:uppercase;
+    letter-spacing: 0.05em; color: var(--muted); margin-bottom: 3px; font-weight: 600; }
+  .card .ac { margin: 6px 0 0; padding: 0 0 0 18px; color: var(--muted); font-size: 12.5px; }
+  .card .ac li { margin: 1px 0; }
+  .ts { color: var(--muted); font-size: 11px; margin-top: 6px; }
+
+  .alerts { margin-top: 22px; }
+  .alerts h2 { font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--accent); margin: 0 0 10px; }
+  .alert { background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
+
+  .empty { color: var(--muted); font-size: 12px; padding: 8px 4px; font-style: italic; }
+  .pulse { display:inline-block; width:8px; height:8px; border-radius:50%;
+    background: var(--progress); margin-right:6px; vertical-align: 1px;
+    animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% {opacity:1} 50% {opacity:.3} }
+  .error { color: var(--blocked); padding: 18px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <div style="flex:1; min-width: 260px;">
+    <a href="/" class="back">← Hub</a>
+    <h1 id="project">Loading…</h1>
+    <div class="meta" id="meta"></div>
+    <div class="filters" id="filters" hidden>
+      <label>agent:</label>
+    </div>
+  </div>
+  <div class="meta">auto-refresh: <b>5s</b> · last sync: <b id="lastSeen">—</b></div>
+</header>
+
+<main>
+  <div class="board">
+    <section class="col" data-col="todo">       <h2>To Do <span class="count" id="c-todo">0</span></h2>        <div id="todo"></div></section>
+    <section class="col" data-col="in_progress"><h2>In Progress <span class="count" id="c-in_progress">0</span></h2><div id="in_progress"></div></section>
+    <section class="col" data-col="blocked">    <h2>Blocked <span class="count" id="c-blocked">0</span></h2>     <div id="blocked"></div></section>
+    <section class="col" data-col="done">       <h2>Done <span class="count" id="c-done">0</span></h2>          <div id="done"></div></section>
+  </div>
+
+  <div class="alerts" id="alertsBox" hidden>
+    <h2>Notes for human</h2>
+    <div id="alerts"></div>
+  </div>
+</main>
+
+<script>
+const SLUG = "{{SLUG}}";
+const escape = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = ts => { if (!ts) return ''; const d=new Date(ts); return isNaN(d)?ts:d.toLocaleString(); };
+
+function agentColor(name) {
+  const palette = ['#c2410c','#1d4ed8','#15803d','#9333ea','#0891b2','#be123c','#a16207','#0f766e'];
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return palette[h % palette.length];
+}
+
+let currentFilter = localStorage.getItem('agentFilter:' + SLUG) || 'all';
+
+function renderCard(card, col) {
+  const deps = (card.depends_on || []).map(d => `<span>${escape(d)}</span>`).join('');
+  const ac = (card.acceptance_criteria || []);
+  const acBlock = ac.length
+    ? `<ul class="ac">${ac.map(x => `<li>${escape(x)}</li>`).join('')}</ul>`
+    : '';
+  let extra = '';
+  if (col === 'in_progress' && card.progress_notes) {
+    extra += `<div class="note"><b>Progress</b>${escape(card.progress_notes)}</div>`;
+  }
+  if (col === 'blocked' && card.blocker) {
+    extra += `<div class="note"><b>Blocker</b>${escape(card.blocker)}</div>`;
+  }
+  if (col === 'done' && card.notes) {
+    extra += `<div class="note"><b>Outcome</b>${escape(card.notes)}</div>`;
+  }
+  const tsParts = [];
+  if (card.started_at)   tsParts.push(`started ${fmt(card.started_at)}`);
+  if (card.completed_at) tsParts.push(`done ${fmt(card.completed_at)}`);
+  if (card.branch)       tsParts.push(`branch <code>${escape(card.branch)}</code>`);
+  const ts = tsParts.length ? `<div class="ts">${tsParts.join(' · ')}</div>` : '';
+  const pulse = col === 'in_progress' ? '<span class="pulse"></span>' : '';
+  const agent = card.agent || 'any';
+  const color = agentColor(agent);
+  const agentChip = `<span class="agent-chip" style="background:${color}22;color:${color};border:1px solid ${color}44">${escape(agent)}</span>`;
+  const metaRow = `<div class="meta-row">${agentChip}${deps ? `<div class="deps">${deps}</div>` : ''}</div>`;
+  return `
+    <article class="card" data-agent="${escape(agent)}" style="border-left-color:${color}">
+      <div class="row">
+        <h3>${pulse}${escape(card.title)}</h3>
+        <span class="id">${escape(card.id || '')}</span>
+      </div>
+      ${card.description ? `<p>${escape(card.description)}</p>` : ''}
+      ${acBlock}
+      ${metaRow}
+      ${extra}
+      ${ts}
+    </article>`;
+}
+
+function renderFilterBar(agents) {
+  const wrap = document.getElementById('filters');
+  if (!agents || Object.keys(agents).length <= 1) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  while (wrap.children.length > 1) wrap.removeChild(wrap.lastChild);
+  const buttons = [['all','#888']];
+  for (const name of Object.keys(agents)) buttons.push([name, agentColor(name)]);
+  for (const [name, color] of buttons) {
+    const b = document.createElement('button');
+    b.className = 'filter-btn' + (currentFilter === name ? ' active' : '');
+    b.innerHTML = name === 'all' ? `all`
+      : `<span class="dot" style="background:${color}"></span>${escape(name)}`;
+    b.onclick = () => {
+      currentFilter = name; localStorage.setItem('agentFilter:' + SLUG, name); refresh();
+    };
+    wrap.appendChild(b);
+  }
+}
+
+function applyFilter(items) {
+  if (currentFilter === 'all') return items;
+  return items.filter(c => (c.agent || 'any') === currentFilter);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(`/api/projects/${SLUG}?t=${Date.now()}`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    document.title = data.project_name + ' — Kanban';
+    document.getElementById('project').textContent = data.project_name;
+    document.getElementById('meta').innerHTML =
+      `updated ${escape(fmt(data.updated_at))}` +
+      (data.agents ? ` · ${Object.keys(data.agents).length} agent(s)` : '');
+    renderFilterBar(data.agents || {});
+    for (const col of ['todo','in_progress','blocked','done']) {
+      const items = applyFilter((data.columns?.[col]) || []);
+      document.getElementById('c-' + col).textContent = items.length;
+      const el = document.getElementById(col);
+      el.innerHTML = items.length
+        ? items.map(c => renderCard(c, col)).join('')
+        : '<div class="empty">— empty —</div>';
+    }
+    const notes = data.notes_for_human || [];
+    const box = document.getElementById('alertsBox');
+    if (notes.length) {
+      box.hidden = false;
+      document.getElementById('alerts').innerHTML =
+        notes.map(n => `<div class="alert">${escape(typeof n === 'string' ? n : (n.message || JSON.stringify(n)))}</div>`).join('');
+    } else {
+      box.hidden = true;
+    }
+    document.getElementById('lastSeen').textContent = new Date().toLocaleTimeString();
+  } catch (e) {
+    document.querySelector('main').innerHTML =
+      `<div class="error">Failed to load board: ${escape(e.message)}</div>`;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
