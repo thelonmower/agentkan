@@ -233,6 +233,28 @@ CLAIM2=$(./claim.sh backend)
                        || fail "expected B100 after merge, got '$CLAIM2'"
 cd "$ROOT"
 
+# ---------- 10. kill switch -----------------------------------------------
+section "kill switch"
+touch "$KANBAN_HUB/.killswitch"
+TICK_OUT=$(kanban tick 2>&1 || true)
+echo "$TICK_OUT" | grep -qi "kill switch" \
+  && pass "kanban tick blocked while kill switch engaged" \
+  || fail "tick ignored kill switch: $TICK_OUT"
+RUN_OUT=$(cd "$PROJ" && ./runner.sh backend 2>&1 || true)
+echo "$RUN_OUT" | grep -qi "kill switch" \
+  && pass "runner.sh honors kill switch" \
+  || fail "runner ignored kill switch: $RUN_OUT"
+rm -f "$KANBAN_HUB/.killswitch"
+
+# ---------- 11. per-agent pause -------------------------------------------
+section "per-agent pause"
+touch "$PROJ/.paused-backend"
+RUN_OUT=$(cd "$PROJ" && ./runner.sh backend 2>&1 || true)
+echo "$RUN_OUT" | grep -qi "agent paused" \
+  && pass "runner.sh skips a paused agent" \
+  || fail "runner ran a paused agent: $RUN_OUT"
+rm -f "$PROJ/.paused-backend"
+
 # ---------- summary -------------------------------------------------------
 echo
 if [ $FAILED -eq 0 ]; then

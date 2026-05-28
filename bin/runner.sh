@@ -9,8 +9,13 @@ AGENT="${1:?usage: ./runner.sh <agent-name>}"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
-# Skip if project is paused
+# Global kill switch (hub-level) — stops everything until released.
+HUB_DIR="${KANBAN_HUB:-$HOME/.kanban-hub}"
+[[ -f "$HUB_DIR/.killswitch" ]] && { echo "$(date -u +%FT%TZ) [$AGENT] kill switch engaged"; exit 0; }
+
+# Skip if the whole project is paused, or just this agent is paused/stopped.
 [[ -f .paused ]] && { echo "$(date -u +%FT%TZ) [$AGENT] project paused"; exit 0; }
+[[ -f ".paused-$AGENT" ]] && { echo "$(date -u +%FT%TZ) [$AGENT] agent paused"; exit 0; }
 
 # Per-agent lock: prevents overlapping runs of THIS agent on THIS project
 LOCK="$PROJECT_DIR/.lock-$AGENT"
@@ -19,6 +24,11 @@ if ! flock -n 200; then
   echo "$(date -u +%FT%TZ) [$AGENT] another run in progress, exiting."
   exit 0
 fi
+
+# Record our PID so the dashboard's stop button / kill switch can signal us.
+# The server also cleans this up after killing; the trap covers normal exit.
+echo $$ > ".run-$AGENT.pid"
+trap 'rm -f "$PROJECT_DIR/.run-$AGENT.pid"' EXIT INT TERM
 
 mkdir -p "logs/$AGENT"
 LOG="logs/$AGENT/$(date -u +%Y%m%dT%H%M%SZ).log"

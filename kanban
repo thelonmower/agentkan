@@ -13,7 +13,10 @@ Subcommands:
   add-card <project>   add a card to an existing project (intake interview)
   add-agent <project>  add a new agent to an existing project (intake interview)
   pause <project>      disable cron ticks for a project
-  resume <project>     re-enable
+  resume <project>     re-enable (optionally: resume <project> <agent>)
+  stop <project> <ag>  stop a running agent (kill its process + pause it)
+  kill                 KILL SWITCH: stop every agent everywhere + block ticks
+  unkill               release the kill switch
   status               quick overview of everything
   cron                 print the cron line to install
 """
@@ -24,6 +27,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -140,6 +144,86 @@ def awaiting_merge(board: dict) -> dict:
             a = c.get("agent", "?")
             out[a] = out.get(a, 0) + 1
     return out
+
+# ---------------------------------------------------------------------------
+# process control — per-agent stop + global kill switch
+#
+# A running tick is `runner.sh <agent>`, which (via cmd_tick) is launched in its
+# OWN process group and writes its PID to .run-<agent>.pid. To stop work in
+# flight we signal that process group — killing runner.sh, `timeout`, and the
+# `claude` child together. Pausing an agent (.paused-<agent>) or engaging the
+# global kill switch (HUB/.killswitch) stops anything from restarting.
+
+def killswitch_path() -> Path:
+    return HUB / ".killswitch"
+
+def killswitch_on() -> bool:
+    return killswitch_path().exists()
+
+def agent_pid(pdir: Path, agent: str):
+    """Return the live PID for (project, agent) if its runner is alive, else None."""
+    pf = pdir / f".run-{agent}.pid"
+    if not pf.exists():
+        return None
+    try:
+        pid = int(pf.read_text().strip())
+        os.kill(pid, 0)            # liveness probe; raises OSError if dead
+        return pid
+    except (ValueError, OSError):
+        return None
+
+def stop_agent_proc(pdir: Path, agent: str) -> bool:
+    """TERM (then KILL) the running process group for (project, agent).
+    Returns True if a live process was signalled."""
+    pid = agent_pid(pdir, agent)
+    pf = pdir / f".run-{agent}.pid"
+    if pid is None:
+        pf.unlink(missing_ok=True)
+        return False
+    try:
+        pgid = os.getpgid(pid)
+        # Group-kill only when the runner is its own group leader (how cmd_tick
+        # launches it, with start_new_session). Otherwise signal just the pid so
+        # we never take down an unrelated process group (e.g. a dev's shell).
+        group = (pgid == pid)
+        (os.killpg if group else os.kill)(pgid if group else pid, signal.SIGTERM)
+        time.sleep(1.5)
+        if agent_pid(pdir, agent) is not None:
+            (os.killpg if group else os.kill)(pgid if group else pid, signal.SIGKILL)
+    except OSError:
+        pass
+    pf.unlink(missing_ok=True)
+    return True
+
+def stop_agent(pdir: Path, agent: str) -> bool:
+    """Kill any running process for the agent AND pause it so it won't restart."""
+    killed = stop_agent_proc(pdir, agent)
+    (pdir / f".paused-{agent}").touch()
+    return killed
+
+def resume_agent(pdir: Path, agent: str):
+    (pdir / f".paused-{agent}").unlink(missing_ok=True)
+
+def agent_paused(pdir: Path, agent: str) -> bool:
+    return (pdir / f".paused-{agent}").exists()
+
+def engage_killswitch() -> list:
+    """Kill every running agent across all projects and set the global flag so
+    no further ticks fire until disengaged."""
+    killed = []
+    for pdir in list_project_dirs():
+        try:
+            board = load_board(pdir)
+        except Exception:
+            continue
+        for agent in board.get("agents", {}):
+            if stop_agent_proc(pdir, agent):
+                killed.append(f"{pdir.name}/{agent}")
+    killswitch_path().touch()
+    return killed
+
+def disengage_killswitch():
+    killswitch_path().unlink(missing_ok=True)
 
 # ---------------------------------------------------------------------------
 # init
@@ -370,6 +454,9 @@ def cmd_merge(args):
 def cmd_tick(args):
     """Iterate every project, fire each agent that has work. Background-parallel."""
     HUB_LOGS.mkdir(exist_ok=True)
+    if killswitch_on():
+        print(f"{now_iso()} kill switch engaged — no ticks fired (release: kanban unkill)")
+        return
     fired = []
     for pdir in list_project_dirs():
         if (pdir / ".paused").exists():
@@ -380,12 +467,18 @@ def cmd_tick(args):
             print(f"skip {pdir.name}: {e}", file=sys.stderr)
             continue
         for agent in board.get("agents", {}):
+            if agent_paused(pdir, agent):
+                continue
             # Per-(project, agent) lock is inside runner.sh, so concurrent fires are safe.
             log_dir = pdir / "logs" / agent
             log_dir.mkdir(parents=True, exist_ok=True)
             logf = open(log_dir / "tick.log", "a")
+            # start_new_session: give each runner its own process group so the
+            # dashboard's stop button / kill switch can signal the whole tree
+            # (runner.sh + timeout + claude) at once.
             subprocess.Popen(["./runner.sh", agent], cwd=pdir,
-                             stdout=logf, stderr=subprocess.STDOUT)
+                             stdout=logf, stderr=subprocess.STDOUT,
+                             start_new_session=True)
             fired.append(f"{pdir.name}/{agent}")
     if fired:
         print(f"{now_iso()} fired: {', '.join(fired)}")
@@ -400,8 +493,30 @@ def cmd_pause(args):
 
 def cmd_resume(args):
     pdir = project_dir(args.project)
-    (pdir / ".paused").unlink(missing_ok=True)
-    print(color(f"✓ resumed {pdir.name}", C_GREEN))
+    if getattr(args, "agent", None):
+        resume_agent(pdir, args.agent)
+        print(color(f"✓ resumed {pdir.name}/{args.agent}", C_GREEN))
+    else:
+        (pdir / ".paused").unlink(missing_ok=True)
+        print(color(f"✓ resumed {pdir.name}", C_GREEN))
+
+def cmd_stop(args):
+    pdir = project_dir(args.project)
+    killed = stop_agent(pdir, args.agent)
+    state = "killed live run" if killed else "nothing was running"
+    print(color(f"✓ stopped {pdir.name}/{args.agent} ({state}) — agent paused", C_YELLOW))
+    print(color(f"  resume with: kanban resume {pdir.name} {args.agent}", C_DIM))
+
+def cmd_kill(args):
+    killed = engage_killswitch()
+    print(color("✗ KILL SWITCH ENGAGED — all agents stopped, all ticks blocked", C_RED))
+    if killed:
+        print("  killed in flight: " + ", ".join(killed))
+    print(color("  release with: kanban unkill", C_DIM))
+
+def cmd_unkill(args):
+    disengage_killswitch()
+    print(color("✓ kill switch released — ticks will resume on the next cron run", C_GREEN))
 
 # ---------------------------------------------------------------------------
 # cron
@@ -445,6 +560,11 @@ class HubHandler(BaseHTTPRequestHandler):
                                                b["columns"]["in_progress"]],
                         "awaiting_merge": awaiting_merge(b),
                         "claimable": claimable_count(b),
+                        "paused_agents": [a for a in b.get("agents", {})
+                                          if agent_paused(pdir, a)],
+                        "running_agents": [a for a in b.get("agents", {})
+                                           if agent_pid(pdir, a) is not None],
+                        "killswitch": killswitch_on(),
                     })
                 except Exception:
                     continue
@@ -469,6 +589,39 @@ class HubHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/static/(.+)$", path)
         if m:
             return self._serve_static(m.group(1))
+
+        self._404()
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
+        q = urllib.parse.parse_qs(url.query)
+        def arg(name):
+            return (q.get(name) or [None])[0]
+
+        # Global kill switch
+        if path == "/api/kill":
+            killed = engage_killswitch()
+            return self._json({"ok": True, "killswitch": True, "killed": killed})
+        if path == "/api/unkill":
+            disengage_killswitch()
+            return self._json({"ok": True, "killswitch": False})
+
+        # Per-agent stop / resume
+        slug, agent = arg("project"), arg("agent")
+        if path in ("/api/stop", "/api/resume"):
+            if not slug or not agent:
+                return self._json({"ok": False, "error": "project and agent required"})
+            pdir = HUB_PROJECTS / slug
+            if not (pdir / "kanban.json").exists():
+                return self._404()
+            if agent not in load_board(pdir).get("agents", {}):
+                return self._json({"ok": False, "error": f"no agent '{agent}'"})
+            if path == "/api/stop":
+                killed = stop_agent(pdir, agent)
+                return self._json({"ok": True, "stopped": agent, "killed_live": killed})
+            resume_agent(pdir, agent)
+            return self._json({"ok": True, "resumed": agent})
 
         self._404()
 
@@ -579,8 +732,19 @@ def main():
     sp = sub.add_parser("pause", help="disable cron ticks for a project")
     sp.add_argument("project"); sp.set_defaults(fn=cmd_pause)
 
-    sp = sub.add_parser("resume", help="re-enable cron ticks")
-    sp.add_argument("project"); sp.set_defaults(fn=cmd_resume)
+    sp = sub.add_parser("resume", help="re-enable cron ticks (optionally for one agent)")
+    sp.add_argument("project"); sp.add_argument("agent", nargs="?", default=None)
+    sp.set_defaults(fn=cmd_resume)
+
+    sp = sub.add_parser("stop", help="stop a running agent: kill its process + pause it")
+    sp.add_argument("project"); sp.add_argument("agent")
+    sp.set_defaults(fn=cmd_stop)
+
+    sp = sub.add_parser("kill", help="KILL SWITCH: stop every agent + block all ticks")
+    sp.set_defaults(fn=cmd_kill)
+
+    sp = sub.add_parser("unkill", help="release the kill switch")
+    sp.set_defaults(fn=cmd_unkill)
 
     sp = sub.add_parser("cron", help="print the cron line to install")
     sp.set_defaults(fn=cmd_cron)

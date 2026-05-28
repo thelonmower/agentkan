@@ -82,14 +82,52 @@
     margin-left: 8px; vertical-align: 2px; }
 
   .error { color: var(--blocked); padding: 18px; font-family: ui-monospace, monospace; }
+
+  .hdr-right { display:flex; align-items:center; gap:18px; }
+  .kill-btn { font: 600 12px/1 ui-sans-serif, system-ui, sans-serif; cursor:pointer;
+    border:1px solid var(--blocked); color:var(--blocked); background:transparent;
+    padding:8px 14px; border-radius:8px; letter-spacing:0.03em; }
+  .kill-btn:hover { background: var(--blocked); color:#fff; }
+  .kill-btn.engaged { background: var(--blocked); color:#fff;
+    animation: kpulse 1.2s ease-in-out infinite; }
+  @keyframes kpulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+
+  .kill-banner { background: var(--blocked); color:#fff; font-weight:600; font-size:13px;
+    padding:10px 32px; display:flex; align-items:center; gap:14px; }
+  .kill-banner button { font:600 12px/1 ui-sans-serif, system-ui, sans-serif; cursor:pointer;
+    border:1px solid #fff; color:#fff; background:transparent; padding:5px 12px; border-radius:6px; }
+  .kill-banner button:hover { background:#fff; color:var(--blocked); }
+
+  .agents-col { display:flex; flex-direction:column; gap:6px; margin: 8px 0 14px; }
+  .agent-row { display:flex; align-items:center; gap:8px; }
+  .agent-row .agent-chip { display:inline-flex; align-items:center; }
+  .agent-state { font-size:10px; text-transform:uppercase; letter-spacing:0.05em;
+    color: var(--muted); }
+  .agent-state.run { color: var(--progress); font-weight:600; }
+  .ab { font:600 11px/1 ui-sans-serif, system-ui, sans-serif; cursor:pointer;
+    border-radius:6px; padding:4px 10px; border:1px solid var(--line);
+    background:var(--bg); color:var(--ink); margin-left:auto; }
+  .ab.stop { border-color: color-mix(in srgb, var(--blocked) 45%, transparent);
+    color: var(--blocked); }
+  .ab.stop:hover { background: var(--blocked); color:#fff; }
+  .ab.resume { border-color: color-mix(in srgb, var(--done) 45%, transparent);
+    color: var(--done); }
+  .ab.resume:hover { background: var(--done); color:#fff; }
 </style>
 </head>
 <body>
 
 <header>
   <h1>agent<span>kan</span></h1>
-  <div class="meta">auto-refresh: <b>5s</b> · last sync: <b id="lastSeen">—</b></div>
+  <div class="hdr-right">
+    <div class="meta">auto-refresh: <b>5s</b> · last sync: <b id="lastSeen">—</b></div>
+    <button id="killBtn" class="kill-btn" onclick="killAll(event)">◼ KILL ALL</button>
+  </div>
 </header>
+<div id="killBanner" class="kill-banner" style="display:none">
+  <span>⚠ KILL SWITCH ENGAGED — every agent is stopped and no ticks will run.</span>
+  <button onclick="unkill(event)">Release</button>
+</div>
 
 <main>
   <div id="content"></div>
@@ -107,9 +145,21 @@ function agentColor(name) {
 }
 
 function tile(p) {
-  const agentChips = (p.agents || []).map(a => {
+  const running = new Set(p.running_agents || []);
+  const paused  = new Set(p.paused_agents || []);
+  const agentRows = (p.agents || []).map(a => {
     const c = agentColor(a);
-    return `<span class="agent-chip" style="background:${c}22;color:${c};border:1px solid ${c}44">${escape(a)}</span>`;
+    const isRun = running.has(a), isPaused = paused.has(a);
+    const dot = isRun ? '<span class="pulse"></span>' : '';
+    const state = isPaused ? '<span class="agent-state">paused</span>'
+                : isRun    ? '<span class="agent-state run">running</span>' : '';
+    const btn = isPaused
+      ? `<button class="ab resume" onclick="agentAction(event,'resume','${escape(p.slug)}','${escape(a)}')">resume</button>`
+      : `<button class="ab stop" onclick="agentAction(event,'stop','${escape(p.slug)}','${escape(a)}')">stop</button>`;
+    return `<div class="agent-row">
+      <span class="agent-chip" style="background:${c}22;color:${c};border:1px solid ${c}44">${dot}${escape(a)}</span>
+      ${state}${btn}
+    </div>`;
   }).join('');
 
   const cells = ['todo','in_progress','blocked','done'].map(k => `
@@ -133,22 +183,53 @@ function tile(p) {
     : '';
 
   return `
-    <a class="${cls}" href="/project/${escape(p.slug)}/">
-      <h2>${escape(p.project_name)}${pausedBadge}</h2>
-      <div class="agents">${agentChips || '<span style="color:var(--muted);font-size:12px">no agents yet</span>'}</div>
+    <div class="${cls}">
+      <h2><a href="/project/${escape(p.slug)}/" style="color:inherit;text-decoration:none">${escape(p.project_name)}</a>${pausedBadge}</h2>
+      <div class="agents-col">${agentRows || '<span style="color:var(--muted);font-size:12px">no agents yet</span>'}</div>
       <div class="stats">${cells}</div>
       ${nowBlock}
       ${mergeBlock}
-    </a>`;
+    </div>`;
 }
 
 function C_DIM(s) { return `<span style="color:var(--muted)">${escape(s)}</span>`; }
+
+async function post(path) {
+  try { return await (await fetch(path, {method:'POST'})).json(); }
+  catch (e) { alert('Action failed: ' + e.message); return null; }
+}
+async function agentAction(ev, action, slug, agent) {
+  ev.preventDefault(); ev.stopPropagation();
+  if (action === 'stop' &&
+      !confirm(`Stop ${slug} / ${agent}?\n\nThis kills its in-flight run and pauses the agent until you resume it.`))
+    return;
+  await post(`/api/${action}?project=${encodeURIComponent(slug)}&agent=${encodeURIComponent(agent)}`);
+  refresh();
+}
+async function killAll(ev) {
+  ev.preventDefault();
+  if (!confirm('KILL ALL agents across every project?\n\nThis stops every running agent and blocks all ticks until you release the kill switch.'))
+    return;
+  await post('/api/kill'); refresh();
+}
+async function unkill(ev) {
+  ev.preventDefault();
+  await post('/api/unkill'); refresh();
+}
 
 async function refresh() {
   try {
     const r = await fetch('/api/projects?t=' + Date.now());
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const projects = await r.json();
+
+    // Global kill-switch state (same flag on every project record).
+    const ks = projects.some(p => p.killswitch);
+    document.getElementById('killBanner').style.display = ks ? '' : 'none';
+    const kb = document.getElementById('killBtn');
+    kb.textContent = ks ? '◼ KILLED' : '◼ KILL ALL';
+    kb.classList.toggle('engaged', ks);
+
     const el = document.getElementById('content');
     if (!projects.length) {
       el.innerHTML = `
