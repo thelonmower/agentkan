@@ -239,12 +239,34 @@ def load_config() -> dict:
             return {}
     return {}
 
+def tick_interval() -> int:
+    """Minutes between ticks (the */N minute field maxes at 59)."""
+    try:
+        return max(1, min(int(load_config().get("tick_interval_min", 10)), 59))
+    except (TypeError, ValueError):
+        return 10
+
 def cron_line() -> str:
     bin_path = shutil.which("kanban") or str(INSTALL_ROOT / "kanban")
     # Inline PATH prefix so timeout/gtimeout/claude resolve under cron's minimal
     # PATH. Scoped to this command, so other crontab entries are untouched.
     pre = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-    return f"*/10 * * * * PATH={pre}:$PATH {bin_path} tick >> {HUB_LOGS / 'tick.log'} 2>&1"
+    return f"*/{tick_interval()} * * * * PATH={pre}:$PATH {bin_path} tick >> {HUB_LOGS / 'tick.log'} 2>&1"
+
+def save_config(updates: dict):
+    cfg = load_config()
+    cfg.update(updates)
+    (HUB / "config.json").write_text(json.dumps(cfg, indent=2))
+
+def set_interval(minutes: int):
+    """Persist the tick interval and, if cron is already installed, reinstall
+    it so the new cadence takes effect."""
+    minutes = max(1, min(int(minutes), 59))
+    save_config({"tick_interval_min": minutes})
+    if cron_installed():
+        uninstall_cron()
+        install_cron()
+    return minutes
 
 def _crontab_read() -> str:
     if shutil.which("crontab") is None:
@@ -297,6 +319,55 @@ def uninstall_cron() -> bool:
         return False
     return _crontab_write(_cron_remove_text(_crontab_read(), CRON_MARK))
 
+def _ask(msg: str, default: str = "") -> str:
+    try:
+        return input(msg).strip()
+    except EOFError:
+        return default
+
+def wire_cron_for_new_board():
+    """Called at the end of `kanban new`. Interactively asks about the
+    autonomous schedule when run in a terminal; falls back to the config
+    default (auto_cron) when scripted. KANBAN_NO_CRON disables it entirely."""
+    if os.environ.get("KANBAN_NO_CRON") or shutil.which("crontab") is None:
+        return
+
+    # Non-interactive (cron, CI, an agent shelling out): honor config silently.
+    if not sys.stdin.isatty():
+        if load_config().get("auto_cron", True) and not cron_installed():
+            if install_cron() == "installed":
+                print(color(f"  ✓ cron installed — agents tick every {tick_interval()} min "
+                            "(kanban cron --uninstall to stop)", C_GREEN))
+        return
+
+    # Interactive: ask.
+    if cron_installed():
+        print(color(f"\nAutonomous schedule is active (every {tick_interval()} min) and "
+                    "already covers this board.", C_DIM))
+        ans = _ask("Change it?  [Enter = keep · a number = new minutes · 'off' = disable] ")
+        if ans.lower() in ("off", "disable", "stop", "no"):
+            uninstall_cron(); print(color("  ✓ schedule disabled", C_YELLOW))
+        elif ans.isdigit() and int(ans) > 0:
+            print(color(f"  ✓ schedule now every {set_interval(int(ans))} min", C_GREEN))
+        else:
+            print(color("  ✓ kept", C_DIM))
+        return
+
+    print(color("\nAutonomous schedule (cron)", C_BOLD))
+    print("  Runs your agents on a timer with the laptop closed. One schedule covers")
+    print("  every project; change or remove it anytime with `kanban cron`.")
+    if _ask("Enable it now?  [Y/n] ").lower() in ("n", "no"):
+        print(color("  skipped — enable later with: kanban cron --install", C_DIM))
+        return
+    iv = _ask("Tick how often, in minutes?  [10] ")
+    minutes = int(iv) if iv.isdigit() and int(iv) > 0 else 10
+    save_config({"tick_interval_min": min(minutes, 59)})
+    status = install_cron()
+    if status in ("installed", "exists"):
+        print(color(f"  ✓ cron installed — agents tick every {tick_interval()} min", C_GREEN))
+    else:
+        print(color("  ⚠ couldn't install cron; add it later with: kanban cron --install", C_YELLOW))
+
 # ---------------------------------------------------------------------------
 # init
 
@@ -324,6 +395,7 @@ def cmd_init(args):
             "created_at": now_iso(),
             "default_tools": "Read,Write,Edit,Bash,Grep,Glob",
             "auto_cron": True,
+            "tick_interval_min": 10,
         }, indent=2))
     print(color(f"✓ hub ready at {HUB}", C_GREEN))
     print(f"  next: {color('kanban new <project-name>', C_BOLD)}")
@@ -382,18 +454,9 @@ def cmd_new(args):
     else:
         print(f"  → paste this into claude: {color(paste, C_DIM)}")
 
-    # Wire up the autonomous schedule. The tick entry is global (one line runs
-    # every project), so this is idempotent — it only truly installs on the
-    # first board and is a no-op for every board after. Opt out with
-    # `"auto_cron": false` in ~/.kanban-hub/config.json.
-    if load_config().get("auto_cron", True):
-        status = install_cron()
-        if status == "installed":
-            print(color("  ✓ cron installed — agents tick every 10 min (kanban cron --uninstall to stop)", C_GREEN))
-        elif status == "exists":
-            print(color("  ✓ cron already active — one entry runs every project", C_DIM))
-        else:
-            print(color("  ⚠ couldn't auto-install cron; add it later with: kanban cron --install", C_YELLOW))
+    # Ask about the autonomous schedule (interactive), or honor the config
+    # default when scripted. The tick entry is global so this is idempotent.
+    wire_cron_for_new_board()
 
     print()
     print(color("launching claude in interactive mode...", C_CYAN))
