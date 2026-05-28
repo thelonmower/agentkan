@@ -18,7 +18,7 @@ Subcommands:
   kill                 KILL SWITCH: stop every agent everywhere + block ticks
   unkill               release the kill switch
   status               quick overview of everything
-  cron                 print the cron line to install
+  cron [--install|--uninstall]  show/install/remove the autonomous schedule
 """
 from __future__ import annotations
 
@@ -226,6 +226,78 @@ def disengage_killswitch():
     killswitch_path().unlink(missing_ok=True)
 
 # ---------------------------------------------------------------------------
+# cron — the autonomous schedule (one global entry drives every project)
+
+CRON_MARK = "# agentkan autonomous tick — managed by `kanban cron`; delete these 2 lines to disable"
+
+def load_config() -> dict:
+    cfg = HUB / "config.json"
+    if cfg.exists():
+        try:
+            return json.loads(cfg.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def cron_line() -> str:
+    bin_path = shutil.which("kanban") or str(INSTALL_ROOT / "kanban")
+    # Inline PATH prefix so timeout/gtimeout/claude resolve under cron's minimal
+    # PATH. Scoped to this command, so other crontab entries are untouched.
+    pre = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    return f"*/10 * * * * PATH={pre}:$PATH {bin_path} tick >> {HUB_LOGS / 'tick.log'} 2>&1"
+
+def _crontab_read() -> str:
+    if shutil.which("crontab") is None:
+        return ""
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+def _crontab_write(text: str) -> bool:
+    if shutil.which("crontab") is None:
+        return False
+    body = text if text.endswith("\n") else text + "\n"
+    return subprocess.run(["crontab", "-"], input=body, text=True).returncode == 0
+
+def _cron_add_text(current: str, mark: str, line: str):
+    """Pure: new crontab text with our block appended, or None if already present."""
+    if mark in current:
+        return None
+    block = f"{mark}\n{line}\n"
+    return (current.rstrip("\n") + "\n\n" + block) if current.strip() else block
+
+def _cron_remove_text(current: str, mark: str) -> str:
+    """Pure: drop our marker line and the command line that follows it."""
+    out, skip = [], False
+    for ln in current.splitlines():
+        if skip:
+            skip = False
+            continue
+        if ln.strip() == mark.strip():
+            skip = True
+            continue
+        out.append(ln)
+    joined = "\n".join(out).strip("\n")
+    return (joined + "\n") if joined else ""
+
+def cron_installed() -> bool:
+    return CRON_MARK in _crontab_read()
+
+def install_cron() -> str:
+    """Idempotently add the tick line. -> 'installed' | 'exists' | 'unavailable'.
+    KANBAN_NO_CRON disables all crontab writes (used by tests / opt-out users)."""
+    if os.environ.get("KANBAN_NO_CRON") or shutil.which("crontab") is None:
+        return "unavailable"
+    new = _cron_add_text(_crontab_read(), CRON_MARK, cron_line())
+    if new is None:
+        return "exists"
+    return "installed" if _crontab_write(new) else "unavailable"
+
+def uninstall_cron() -> bool:
+    if os.environ.get("KANBAN_NO_CRON") or not cron_installed():
+        return False
+    return _crontab_write(_cron_remove_text(_crontab_read(), CRON_MARK))
+
+# ---------------------------------------------------------------------------
 # init
 
 def cmd_init(args):
@@ -251,6 +323,7 @@ def cmd_init(args):
         cfg.write_text(json.dumps({
             "created_at": now_iso(),
             "default_tools": "Read,Write,Edit,Bash,Grep,Glob",
+            "auto_cron": True,
         }, indent=2))
     print(color(f"✓ hub ready at {HUB}", C_GREEN))
     print(f"  next: {color('kanban new <project-name>', C_BOLD)}")
@@ -309,10 +382,24 @@ def cmd_new(args):
     else:
         print(f"  → paste this into claude: {color(paste, C_DIM)}")
 
+    # Wire up the autonomous schedule. The tick entry is global (one line runs
+    # every project), so this is idempotent — it only truly installs on the
+    # first board and is a no-op for every board after. Opt out with
+    # `"auto_cron": false` in ~/.kanban-hub/config.json.
+    if load_config().get("auto_cron", True):
+        status = install_cron()
+        if status == "installed":
+            print(color("  ✓ cron installed — agents tick every 10 min (kanban cron --uninstall to stop)", C_GREEN))
+        elif status == "exists":
+            print(color("  ✓ cron already active — one entry runs every project", C_DIM))
+        else:
+            print(color("  ⚠ couldn't auto-install cron; add it later with: kanban cron --install", C_YELLOW))
+
     print()
     print(color("launching claude in interactive mode...", C_CYAN))
     print(color("(when intake is done, run: kanban view)", C_DIM))
     print()
+    sys.stdout.flush()   # execvp replaces this process without flushing buffers
     os.chdir(pdir)
     os.execvp("claude", ["claude"])
 
@@ -522,14 +609,32 @@ def cmd_unkill(args):
 # cron
 
 def cmd_cron(args):
-    bin_path = shutil.which("kanban") or str(INSTALL_ROOT / "kanban")
-    line = f"*/10 * * * * {bin_path} tick >> {HUB_LOGS / 'tick.log'} 2>&1"
-    print("Add this line to your crontab (run `crontab -e`):")
+    line = cron_line()
+    if getattr(args, "install", False):
+        status = install_cron()
+        if status == "installed":
+            print(color("✓ cron installed:", C_GREEN)); print(f"  {line}")
+        elif status == "exists":
+            print(color("✓ cron already installed — nothing to do", C_DIM))
+        else:
+            print(color("✗ crontab unavailable — add this line manually (crontab -e):", C_RED))
+            print(f"  {line}")
+        return
+    if getattr(args, "uninstall", False):
+        if uninstall_cron():
+            print(color("✓ cron removed — autonomous ticks stopped", C_GREEN))
+        else:
+            print(color("nothing to remove (cron not installed)", C_DIM))
+        return
+    # Default: show the line + current status.
+    print("Autonomous schedule — one entry runs every project and every agent")
+    print("(per-(project, agent) locks prevent overlap, so they run in parallel):")
     print()
     print(color(f"  {line}", C_BOLD))
     print()
-    print("That's it. One cron entry runs every project and every agent —")
-    print("per-(project, agent) locks prevent overlap and let everything run in parallel.")
+    print("status:  " + (color("installed", C_GREEN) if cron_installed()
+                          else color("not installed", C_YELLOW)))
+    print("manage:  kanban cron --install   |   kanban cron --uninstall")
 
 # ---------------------------------------------------------------------------
 # view — the hub server + browser
@@ -746,7 +851,9 @@ def main():
     sp = sub.add_parser("unkill", help="release the kill switch")
     sp.set_defaults(fn=cmd_unkill)
 
-    sp = sub.add_parser("cron", help="print the cron line to install")
+    sp = sub.add_parser("cron", help="show / install / remove the autonomous schedule")
+    sp.add_argument("--install", action="store_true", help="add the tick line to your crontab (idempotent)")
+    sp.add_argument("--uninstall", action="store_true", help="remove the tick line from your crontab")
     sp.set_defaults(fn=cmd_cron)
 
     args = p.parse_args()

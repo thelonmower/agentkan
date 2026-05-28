@@ -26,6 +26,8 @@ TESTHOME=$(mktemp -d)
 export HOME=$TESTHOME
 export KANBAN_HUB=$TESTHOME/.kanban-hub
 export PATH=$TESTHOME/.local/bin:$PATH
+# NEVER touch the real user crontab from the test suite.
+export KANBAN_NO_CRON=1
 
 # Stub claude so `kanban new` doesn't try to launch it
 mkdir -p $TESTHOME/bin
@@ -254,6 +256,19 @@ echo "$RUN_OUT" | grep -qi "agent paused" \
   && pass "runner.sh skips a paused agent" \
   || fail "runner ran a paused agent: $RUN_OUT"
 rm -f "$PROJ/.paused-backend"
+
+# ---------- 12. cron management (guarded — never writes real crontab) -----
+section "cron"
+# KANBAN_NO_CRON=1 is exported above, so these must NOT modify the crontab.
+kanban cron > /dev/null 2>&1 && pass "kanban cron prints schedule" || fail "kanban cron errored"
+kanban cron --install > /dev/null 2>&1 \
+  && pass "kanban cron --install is graceful when guarded" \
+  || fail "kanban cron --install errored under guard"
+if crontab -l 2>/dev/null | grep -q "agentkan autonomous tick"; then
+  fail "guarded run wrote to the real crontab!"
+else
+  pass "KANBAN_NO_CRON kept the crontab untouched"
+fi
 
 # ---------- summary -------------------------------------------------------
 echo
