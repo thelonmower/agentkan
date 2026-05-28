@@ -37,6 +37,10 @@ if ! command -v claude >/dev/null; then
   warn "Claude Code CLI ('claude') not found in PATH."
   warn "Install it after this: npm install -g @anthropic-ai/claude-code"
 fi
+if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+  warn "no 'timeout'/'gtimeout' on PATH — agent runs will have no 30m safety cap."
+  warn "macOS: brew install coreutils  (provides gtimeout)"
+fi
 
 # --- find the source: local clone or remote tarball ----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd 2>/dev/null || pwd)"

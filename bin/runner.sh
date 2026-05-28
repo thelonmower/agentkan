@@ -73,12 +73,29 @@ echo "[$AGENT] claimed card: $CARD_ID"
 PROMPT=$(sed -e "s/{{AGENT}}/$AGENT/g" -e "s/{{CARD_ID}}/$CARD_ID/g" agent-prompt.md)
 DONE_BEFORE=$(python3 -c "import json; print(len(json.load(open('kanban.json'))['columns']['done']))")
 
+# Resolve a timeout command. GNU coreutils provides `timeout` on Linux and
+# `gtimeout` on macOS (brew install coreutils). macOS ships NEITHER by default,
+# so fall back to running without a hard cap rather than failing the whole run.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
+else
+  echo "$(date -u +%FT%TZ) [$AGENT] WARN: no 'timeout'/'gtimeout' on PATH — running without the 30m cap. Install it with: brew install coreutils"
+fi
+
+CLAUDE_ARGS=(-p "$PROMPT"
+  --permission-mode acceptEdits
+  --allowedTools "Read,Write,Edit,Bash,Grep,Glob"
+  --output-format json)
+
 set +e
-timeout 30m claude -p "$PROMPT" \
-  --permission-mode acceptEdits \
-  --allowedTools "Read,Write,Edit,Bash,Grep,Glob" \
-  --output-format json \
-  > "logs/$AGENT/last-result.json"
+if [[ -n "$TIMEOUT_BIN" ]]; then
+  "$TIMEOUT_BIN" 30m claude "${CLAUDE_ARGS[@]}" > "logs/$AGENT/last-result.json"
+else
+  claude "${CLAUDE_ARGS[@]}" > "logs/$AGENT/last-result.json"
+fi
 RC=$?
 set -e
 
