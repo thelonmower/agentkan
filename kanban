@@ -8,6 +8,7 @@ Subcommands:
   list                 list all projects with status
   view [project]       launch the hub UI in your browser (or a single board)
   run <project> <ag>   run one tick for one agent (cron / manual)
+  merge <project> <ag> merge an agent's branch to main + unblock dependents
   tick                 run one tick across ALL projects and agents (cron entry)
   add-card <project>   add a card to an existing project (intake interview)
   add-agent <project>  add a new agent to an existing project (intake interview)
@@ -106,6 +107,40 @@ def copy_clipboard(text: str) -> str | None:
                 pass
     return None
 
+def _dep_ok(dep_id, claiming_agent, done_ids, all_cards) -> bool:
+    """Mirror of claim.sh's dependency rule (kept in sync deliberately):
+    a same-agent dep is satisfied when done; a cross-agent dep must be
+    merged_to_main so the code is actually present in the claiming worktree."""
+    if dep_id not in done_ids:
+        return False
+    dep = all_cards.get(dep_id)
+    if dep is None:
+        return False
+    if dep.get("agent") == claiming_agent:
+        return True
+    return bool(dep.get("merged_to_main"))
+
+def claimable_count(board: dict) -> int:
+    """How many todo cards are claimable right now (all deps satisfied)."""
+    done_ids = {c["id"] for c in board["columns"]["done"]}
+    all_cards = {c["id"]: c for col in board["columns"].values() for c in col}
+    n = 0
+    for c in board["columns"]["todo"]:
+        deps = c.get("depends_on") or []
+        if all(_dep_ok(d, c.get("agent"), done_ids, all_cards) for d in deps):
+            n += 1
+    return n
+
+def awaiting_merge(board: dict) -> dict:
+    """{agent: count} of done cards not yet merged to main. These are what a
+    human needs to `kanban merge` to unblock cross-agent dependents."""
+    out: dict = {}
+    for c in board["columns"]["done"]:
+        if not c.get("merged_to_main"):
+            a = c.get("agent", "?")
+            out[a] = out.get(a, 0) + 1
+    return out
+
 # ---------------------------------------------------------------------------
 # init
 
@@ -169,7 +204,7 @@ def cmd_new(args):
     (pdir / "kanban.json").write_text(json.dumps(placeholder, indent=2))
 
     # Copy the per-project scripts so the project is self-sufficient
-    for fn in ("runner.sh", "claim.sh", "notify.sh", "setup-agents.sh"):
+    for fn in ("runner.sh", "claim.sh", "update-card.sh", "notify.sh", "setup-agents.sh"):
         shutil.copy(HUB_BIN / fn, pdir / fn)
         (pdir / fn).chmod(0o755)
     shutil.copy(HUB_PROMPTS / "runtime-agent.md", pdir / "agent-prompt.md")
@@ -250,6 +285,13 @@ def cmd_list(args):
         print(f"  agents: {agents}")
         print(f"  todo {n['todo']}  ·  in_progress {color(n['in_progress'], C_CYAN)}  ·  "
               f"blocked {color(n['blocked'], C_YELLOW)}  ·  done {color(n['done'], C_GREEN)}")
+        aw = awaiting_merge(b)
+        if aw:
+            total = sum(aw.values())
+            detail = ", ".join(f"{a} ({c})" for a, c in sorted(aw.items()))
+            print(color(f"  ⚠ {total} done card(s) awaiting merge: {detail}", C_YELLOW))
+            print(color(f"    merge to unblock dependents:  "
+                        f"kanban merge {pdir.name} <agent>", C_DIM))
         print()
 
 def cmd_status(args):
@@ -263,6 +305,67 @@ def cmd_run(args):
     agent = args.agent
     rc = subprocess.call(["./runner.sh", agent], cwd=pdir)
     sys.exit(rc)
+
+def cmd_merge(args):
+    """Merge an agent's branch into main, then flag its done cards merged_to_main
+    so cross-agent dependents become claimable. This is the human's review gate:
+    inspect the agent's branch, then run this to publish the work to main."""
+    import fcntl
+    pdir = project_dir(args.project)
+    agent = args.agent
+    board = load_board(pdir)
+    if agent not in board.get("agents", {}):
+        die(f"agent {agent!r} not declared in {pdir.name}")
+    branch = board["agents"][agent]["branch"]
+    repo = pdir / "repo"
+    if not (repo / ".git").exists():
+        die("repo/ not initialized — run ./setup-agents.sh first")
+
+    def git(*a, check=True):
+        return subprocess.run(["git", "-C", str(repo), *a],
+                              capture_output=True, text=True, check=check)
+
+    # repo/ must be on main to merge into it.
+    cur = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if cur != "main":
+        git("checkout", "main")
+
+    ahead = git("rev-list", "--count", f"main..{branch}", check=False).stdout.strip() or "0"
+    if ahead == "0":
+        print(color(f"nothing to merge — {branch} has no commits beyond main", C_YELLOW))
+    else:
+        r = git("merge", "--no-ff", branch, "-m", f"merge {branch} into main", check=False)
+        if r.returncode != 0:
+            git("merge", "--abort", check=False)
+            die(f"merge conflict merging {branch} into main — NOT merged.\n"
+                f"resolve by hand:\n    cd {repo} && git merge {branch}\n\n"
+                f"{r.stdout}\n{r.stderr}")
+        print(color(f"✓ merged {branch} into main ({ahead} commit(s))", C_GREEN))
+
+    # Flag done cards as merged under the board lock.
+    with open(pdir / ".board-lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        board = load_board(pdir)                 # reload fresh inside the lock
+        before = claimable_count(board)
+        now = now_iso()
+        marked = 0
+        for c in board["columns"]["done"]:
+            if c.get("agent") == agent and not c.get("merged_to_main"):
+                c["merged_to_main"] = True
+                c["merged_at"] = now
+                marked += 1
+        board["updated_at"] = now
+        tmp = pdir / ".kanban.merge.tmp"
+        tmp.write_text(json.dumps(board, indent=2))
+        os.replace(tmp, pdir / "kanban.json")
+        after = claimable_count(board)
+
+    print(f"  flagged {marked} done card(s) as merged_to_main")
+    unblocked = max(0, after - before)
+    if unblocked:
+        print(color(f"  → {unblocked} card(s) now claimable on the next tick", C_GREEN))
+    elif marked:
+        print(color("  (no newly-claimable cards yet — dependents may need other merges too)", C_DIM))
 
 def cmd_tick(args):
     """Iterate every project, fire each agent that has work. Background-parallel."""
@@ -340,6 +443,8 @@ class HubHandler(BaseHTTPRequestHandler):
                                    ("todo", "in_progress", "blocked", "done")},
                         "in_progress_titles": [c.get("title","") for c in
                                                b["columns"]["in_progress"]],
+                        "awaiting_merge": awaiting_merge(b),
+                        "claimable": claimable_count(b),
                     })
                 except Exception:
                     continue
@@ -455,6 +560,10 @@ def main():
     sp = sub.add_parser("run", help="run one tick for one agent")
     sp.add_argument("project"); sp.add_argument("agent")
     sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("merge", help="merge an agent's branch to main + unblock dependents")
+    sp.add_argument("project"); sp.add_argument("agent")
+    sp.set_defaults(fn=cmd_merge)
 
     sp = sub.add_parser("tick", help="run one tick across all projects (cron entry)")
     sp.set_defaults(fn=cmd_tick)

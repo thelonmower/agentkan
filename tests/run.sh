@@ -158,6 +158,81 @@ done
 kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 
+# ---------- 8. concurrent completions (lost-update guard) -----------------
+section "concurrent completions"
+# Two agents, each with one claimed card in in_progress. Fire many concurrent
+# update-card.sh "done" calls. Without the board lock, completions clobber each
+# other; with it, both cards land in done exactly once.
+python3 <<PY
+import json
+p = "$PROJ/kanban.json"
+b = json.load(open(p))
+b["status"] = "active"
+b["agents"] = {
+  "ui": {"branch":"agent/ui","worktree":"worktrees/ui","role_file":"agents/ui.md","description":""},
+  "backend": {"branch":"agent/backend","worktree":"worktrees/backend","role_file":"agents/backend.md","description":""},
+}
+b["columns"]["todo"] = []
+b["columns"]["in_progress"] = [
+  {"id":"U001","agent":"ui","title":"u","acceptance_criteria":[],"claimed_by":"ui"},
+  {"id":"B001","agent":"backend","title":"b","acceptance_criteria":[],"claimed_by":"backend"},
+]
+b["columns"]["done"] = []
+b["columns"]["blocked"] = []
+b["notes_for_human"] = []
+json.dump(b, open(p,"w"), indent=2)
+PY
+
+cd "$PROJ"
+for i in 1 2 3 4; do
+  echo '{"agent":"ui","card_id":"U001","outcome":"done","notes":"x"}' | ./update-card.sh &
+  echo '{"agent":"backend","card_id":"B001","outcome":"done","notes":"y"}' | ./update-card.sh &
+done > /tmp/upd.log 2>&1
+wait
+
+RESULT=$(python3 <<PY
+import json
+b = json.load(open("kanban.json"))
+done = sorted(c["id"] for c in b["columns"]["done"])
+inprog = [c["id"] for c in b["columns"]["in_progress"]]
+ok = done == ["B001","U001"] and not inprog
+print("OK" if ok else f"FAIL done={done} in_progress={inprog}")
+PY
+)
+[ "$RESULT" = "OK" ] && pass "8 concurrent completions → both land in done, none lost" \
+                     || fail "completion race: $RESULT"
+cd "$ROOT"
+
+# ---------- 9. cross-agent dependency gating ------------------------------
+section "dep gating"
+# backend's card depends on ui's card. The ui card is done but NOT merged to
+# main, so the backend card must stay unclaimable until merged_to_main is set.
+python3 <<PY
+import json
+p = "$PROJ/kanban.json"
+b = json.load(open(p))
+b["columns"]["todo"] = [
+  {"id":"B100","agent":"backend","title":"dep","acceptance_criteria":[],"depends_on":["U100"]},
+]
+b["columns"]["in_progress"] = []
+b["columns"]["blocked"] = []
+b["columns"]["done"] = [
+  {"id":"U100","agent":"ui","title":"upstream","acceptance_criteria":[],"merged_to_main":False},
+]
+json.dump(b, open(p,"w"), indent=2)
+PY
+
+cd "$PROJ"
+CLAIM1=$(./claim.sh backend)
+[ -z "$CLAIM1" ] && pass "cross-agent dep NOT claimable while upstream unmerged" \
+                 || fail "claimed '$CLAIM1' before upstream merged to main"
+
+python3 -c "import json; p='kanban.json'; b=json.load(open(p)); b['columns']['done'][0]['merged_to_main']=True; json.dump(b,open(p,'w'),indent=2)"
+CLAIM2=$(./claim.sh backend)
+[ "$CLAIM2" = "B100" ] && pass "cross-agent dep claimable after merged_to_main" \
+                       || fail "expected B100 after merge, got '$CLAIM2'"
+cd "$ROOT"
+
 # ---------- summary -------------------------------------------------------
 echo
 if [ $FAILED -eq 0 ]; then

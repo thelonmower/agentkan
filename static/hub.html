@@ -62,6 +62,10 @@
   .now b { color: var(--progress); font-weight: 600; }
   .now ul { margin: 4px 0 0; padding-left: 18px; }
   .now ul li { margin: 2px 0; color: var(--ink); }
+  .merge-flag { margin-top: 8px; font-size: 12px; font-weight: 600;
+    color: var(--blocked); background: color-mix(in srgb, var(--blocked) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--blocked) 35%, transparent);
+    border-radius: 6px; padding: 5px 8px; }
 
   .pulse { display:inline-block; width:7px; height:7px; border-radius:50%;
     background: var(--progress); margin-right:6px;
@@ -122,12 +126,19 @@ function tile(p) {
   const pausedBadge = p.paused ? `<span class="paused-badge">paused</span>` : '';
   const cls = 'tile' + (p.paused ? ' paused' : '');
 
+  const aw = p.awaiting_merge || {};
+  const awTotal = Object.values(aw).reduce((s, n) => s + n, 0);
+  const mergeBlock = awTotal
+    ? `<div class="merge-flag" title="run: kanban merge ${escape(p.slug)} &lt;agent&gt;">⚠ ${awTotal} done card(s) awaiting merge — ${Object.entries(aw).map(([a, n]) => escape(a) + ' (' + n + ')').join(', ')}</div>`
+    : '';
+
   return `
     <a class="${cls}" href="/project/${escape(p.slug)}/">
       <h2>${escape(p.project_name)}${pausedBadge}</h2>
       <div class="agents">${agentChips || '<span style="color:var(--muted);font-size:12px">no agents yet</span>'}</div>
       <div class="stats">${cells}</div>
       ${nowBlock}
+      ${mergeBlock}
     </a>`;
 }
 

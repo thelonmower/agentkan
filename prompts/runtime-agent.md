@@ -19,23 +19,50 @@ parallel on their own branches; you cooperate only through `kanban.json`.
 
 ## Your job this run
 
-1. **`cd worktrees/{{AGENT}} && git pull origin main --no-edit`** so any
-   merged work from other agents lands in your worktree.
+1. **`cd worktrees/{{AGENT}} && git merge main --no-edit`** so any work merged
+   into the local `main` branch by the human lands in your worktree. (There is
+   no `origin` remote — `main` is a local branch in the shared repo. Do NOT
+   `git pull origin main`; it will fail.)
 2. **Read the claimed card** in `in_progress`. Read its `acceptance_criteria`
    carefully. That list IS your contract — finish what's there, no more.
 3. **Do the work** inside your worktree, following `agents/{{AGENT}}.md`.
 4. **Run lint, tests, type-check.** Don't move the card to `done` unless
    they pass. If you can't make them pass, that's a `blocked` outcome.
 5. **Commit** on your branch with a conventional-commit message.
-6. **Exit cleanly with ONE of these outcomes:**
-   - **Done:** every `acceptance_criteria` bullet is true. Move the card
-     to `done`. Set `completed_at`, `branch: "agent/{{AGENT}}"`, and `notes`
-     (1-3 sentences on what shipped, including the commit SHA).
-   - **Blocked:** move to `blocked`, set `blocker` field. Add an entry to
-     `notes_for_human` so it shows up on the board UI.
-   - **Partial:** stay in `in_progress`. Update `progress_notes` with
-     concrete state — files touched, decisions made, what's next, which
-     `acceptance_criteria` are met. The next tick will continue.
+6. **Record your outcome with `./update-card.sh`** — NEVER edit `kanban.json`
+   by hand. Direct edits race with other agents finishing at the same moment
+   and silently clobber each other's results. `update-card.sh` takes the board
+   lock and does a safe read-modify-write. Pipe it ONE JSON object on stdin
+   from the project dir (one level up from your worktree):
+
+   `update-card.sh` lives in the **project root** (the dir containing
+   `kanban.json`, one level up from your worktree). It self-locates, so you can
+   call it by path from anywhere — e.g. `../../update-card.sh` from inside your
+   worktree.
+
+   - **Done** — every `acceptance_criteria` bullet is true:
+     ```bash
+     echo '{"agent":"{{AGENT}}","card_id":"{{CARD_ID}}","outcome":"done",
+            "notes":"<1-3 sentences on what shipped>","commit":"<sha>"}' \
+       | ../../update-card.sh
+     ```
+   - **Blocked** — can't proceed:
+     ```bash
+     echo '{"agent":"{{AGENT}}","card_id":"{{CARD_ID}}","outcome":"blocked",
+            "blocker":"<what is blocking and why>"}' | ../../update-card.sh
+     ```
+     (This auto-adds a `notes_for_human` entry so it shows on the board.)
+   - **Partial** — ran out of budget mid-card:
+     ```bash
+     echo '{"agent":"{{AGENT}}","card_id":"{{CARD_ID}}","outcome":"partial",
+            "progress_notes":"<files touched, decisions, whats next, which AC met>"}' \
+       | ../../update-card.sh
+     ```
+     The card stays `in_progress` and the next tick resumes it.
+
+   `update-card.sh` only lets you modify the card you own — it refuses if the
+   card isn't claimed by you. If it exits non-zero, read the error and retry;
+   do not fall back to editing the JSON directly.
 
 ## Concurrency rules (critical)
 

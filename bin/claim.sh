@@ -34,8 +34,32 @@ for card in board["columns"]["in_progress"]:
         print(card["id"])
         sys.exit(0)
 
-# Build set of completed card IDs for dependency check
+# Build dependency-check structures.
+#   done_ids   — cards marked done (on their owning agent's branch)
+#   all_cards  — id -> card across every column, to inspect a dep's agent/merge state
 done_ids = {c["id"] for c in board["columns"]["done"]}
+all_cards = {}
+for _col in board["columns"].values():
+    for _c in _col:
+        all_cards[_c["id"]] = _c
+
+def dep_ok(dep_id):
+    # An unknown or not-yet-done dependency is never satisfied.
+    if dep_id not in done_ids:
+        return False
+    dep = all_cards.get(dep_id)
+    if dep is None:
+        return False
+    # Same-agent dependency: the claiming agent shares the branch, so the work
+    # is already in its worktree once the upstream card is done.
+    if dep.get("agent") == agent:
+        return True
+    # Cross-agent dependency: the upstream work lives on another agent's branch.
+    # It is only present in THIS agent's worktree after a human merges it to
+    # main (the agent does `git merge main` at the start of each run). So a
+    # cross-agent dep is satisfied only once it is merged_to_main — NOT merely
+    # done. Without this gate, a dependent card claims before the code exists.
+    return bool(dep.get("merged_to_main"))
 
 # Find first eligible todo card for this agent
 chosen = None
@@ -43,7 +67,7 @@ for i, card in enumerate(board["columns"]["todo"]):
     if card.get("agent") != agent:
         continue
     deps = card.get("depends_on", []) or []
-    if not all(d in done_ids for d in deps):
+    if not all(dep_ok(d) for d in deps):
         continue
     chosen = (i, card)
     break
